@@ -3908,7 +3908,7 @@ if __name__ == "__main__":
         # Now update LFN(s) with the full path(s) to the input file(s) using the TURL
         if runJob.usePrefetcher():
             _fname = runJob.getPoolFileCatalogPath()
-            runCommandList[0] = runJob.replaceLFNsWithTURLs(runCommandList[0], _fname, job.inFiles)
+            runCommandList[0] = runJob.replaceLFNsWithTURLs(runCommandList[0], _fname, job.inFiles, runJob.getPilotInitDir())
 
         # download event ranges before athenaMP
         # Pilot will download some event ranges from the Event Server
