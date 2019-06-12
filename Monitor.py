@@ -16,14 +16,14 @@ from shutil import copy, copy2
 from random import shuffle
 from glob import glob
 from JobRecovery import JobRecovery
-from processes import killProcesses, checkProcesses, killOrphans, getMaxMemoryUsageFromCGroups, isCGROUPSSite
+from processes import killProcesses, checkProcesses, killOrphans, getMaxMemoryUsageFromCGroups, get_current_cpu_consumption_time, findProcessesInGroup
 from PilotErrors import PilotErrors
 from FileStateClient import createFileStates, dumpFileStates, getFileState
 from WatchDog import WatchDog
 from PilotTCPServer import PilotTCPServer
 from UpdateHandler import UpdateHandler
 from RunJobFactory import RunJobFactory
-from FileHandling import updatePilotErrorReport, getDirSize, storeWorkDirSize
+from FileHandling import updatePilotErrorReport, getDirSize, storeWorkDirSize, getOsTimesTuple, readFile, get_files, tail, find_latest_modified_file
 
 import inspect
 
@@ -190,6 +190,10 @@ class Monitor:
         # get the limit of the workdir
         maxwdirsize = self.__getMaxAllowedWorkDirSize()
 
+        # add grace margin of 10%
+        maxwdirsize = int(maxwdirsize * 1.10)
+        pUtil.tolog('Added a 10%% grace margin to maxwdir: %d B' % maxwdirsize)
+
         # after multitasking was removed from the pilot, there is actually only one job
         for k in self.__env['jobDic'].keys():
             # get size of workDir
@@ -330,12 +334,21 @@ class Monitor:
 
                     # Only proceed if values are set
                     if maxPSS_int != -1:
-                        maxRSS = pUtil.readpar('maxrss') # string
+                        maxRSS = pUtil.readpar('maxrss')  # string
                         if maxRSS:
+                            # correction for SCORE/4CORE/nCORE jobs on UCORE queues
                             try:
-                                maxRSS_int = 2*int(maxRSS)*1024 # Convert to int and kB
+                                pUtil.tolog('job.coreCount=%f' % float(self.__env['jobDic'][k][1].coreCount))
+                                pUtil.tolog('schedconfig.corecount=%f' % float(pUtil.readpar('corecount')))
+                                scale = float(self.__env['jobDic'][k][1].coreCount) / float(pUtil.readpar('corecount'))
+                                pUtil.tolog('scale=%f' % scale)
+                            except Exception as e:
+                                pUtil.tolog('!!WARNING!!9910!! Exception caught: %s' % e)
+                                scale = 1
+                            try:
+                                maxRSS_int = 2 * int(maxRSS * scale) * 1024  # Convert to int and kB
                             except Exception, e:
-                                pUtil.tolog("!!WARNING!!9900!! Unexpected value for maxRSS: %s" % (e))
+                                pUtil.tolog("!!WARNING!!9900!! Unexpected value for maxRSS: %s" % e)
                             else:
                                 # Compare the maxRSS with the maxPSS from memory monitor
                                 if maxRSS_int > 0:
@@ -354,9 +367,9 @@ class Monitor:
                                             self.__env['jobDic'][k][1].result[2] = self.__error.ERR_PAYLOADEXCEEDMAXMEM
                                             self.__env['jobDic'][k][1].pilotErrorDiag = pilotErrorDiag
                                         else:
-                                            pUtil.tolog("Max memory (maxPSS) used by the payload is within the allowed limit: %d B (2*maxRSS=%d B)" % (maxPSS_int, maxRSS_int))
+                                            pUtil.tolog("Max memory (maxPSS) used by the payload is within the allowed limit: %d kB (2*maxRSS=%d kB, scale=%f)" % (maxPSS_int, maxRSS_int, scale))
                                     else:
-                                        pUtil.tolog("!!WARNING!!9903!! Unpected MemoryMonitor maxPSS value: %d" % (maxPSS_int))
+                                        pUtil.tolog("!!WARNING!!9903!! Unexpected MemoryMonitor maxPSS value: %d" % (maxPSS_int))
                         else:
                             if maxRSS == 0 or maxRSS == "0":
                                 pUtil.tolog("schedconfig.maxrss set to 0 (no memory checks will be done)")
@@ -595,7 +608,7 @@ class Monitor:
         return job
 
     def __updateJobs(self, onlyUpdateStateChangedJobs=False):
-        """ Make final server update for all ended jobs"""
+        """ Send a heartbeat """
 
         # get the stdout tails
         stdout_dictionary = pUtil.getStdoutDictionary(self.__env['jobDic'])
@@ -608,19 +621,46 @@ class Monitor:
                 continue
             self.__env['jobDic'][k][1].lastState = self.__env['jobDic'][k][1].currentState
 
+            # update the CPU consumption time
+            t0 = getOsTimesTuple(self.__env['jobDic'][k][1].workdir)
+            if t0 and self.__env['jobDic'][k][1].currentState == 'running':
+                path = os.path.join(self.__env['jobDic'][k][1].workdir, 'cpid.txt')
+                cpid = readFile(path)
+                if cpid:
+                    try:
+                        _cpid = int(cpid)
+                    except Exception as e:
+                        pUtil.tolog('failed to convert %s to int: %s' % (cpid, e))
+                    else:
+                        cpuconsumptiontime = get_current_cpu_consumption_time(_cpid)
+                        #cpuconsumptiontime = get_instant_cpu_consumption_time(_cpid)
+                        #cpuconsumptiontime = get_instant_cpu_consumption_time(self.__env['jobDic']["prod"][0])
+                        self.__env['jobDic'][k][1].cpuConsumptionTime = int(cpuconsumptiontime)
+                        self.__env['jobDic'][k][1].cpuConsumptionUnit = 's'
+                        self.__env['jobDic'][k][1].cpuConversionFactor = 1.0
+                        pUtil.tolog("Job CPU usage: %d" % (self.__env['jobDic'][k][1].cpuConsumptionTime))
+
             tmp = self.__env['jobDic'][k][1].result[0]
             if tmp != "finished" and tmp != "failed" and tmp != "holding":
 
                 # get the tail if possible
-                try:
-                    self.__env['stdout_tail'] = stdout_dictionary[self.__env['jobDic'][k][1].jobId]
-                    index = "path-%s" % (self.__env['jobDic'][k][1].jobId)
-                    self.__env['stdout_path'] = stdout_dictionary[index]
-                    pUtil.tolog("stdout_path=%s at index=%s" % (self.__env['stdout_path'], index))
-                except Exception, e:
-                    self.__env['stdout_tail'] = "(stdout tail not available)"
-                    self.__env['stdout_path'] = ""
-                    pUtil.tolog("no stdout_path: %s" % (e))
+                if self.__env['jobDic'][k][1].debug:
+                    try:
+                        # find the latest updated log file
+                        list_of_files = get_files(pattern="*.log")
+                        if not list_of_files:  # some TRFs produce logs with different naming scheme
+                            list_of_files = get_files(pattern="log.*")
+                        latest_file = max(list_of_files, key=os.path.getmtime)
+                        pUtil.tolog('tail of file %s will be added to heartbeat' % latest_file)
+                        # now get the tail of the found log file
+                        _tail = latest_file + "\n" + tail(latest_file)
+                        self.__env['stdout_tail'] = _tail  # stdout_dictionary[self.__env['jobDic'][k][1].jobId]
+                        index = "path-%s" % (self.__env['jobDic'][k][1].jobId)
+                        self.__env['stdout_path'] = stdout_dictionary[index]
+                    except Exception, e:
+                        pUtil.tolog("!!WARNING!!4545!! Failed to get stdout tail: %s" % e)
+                        self.__env['stdout_tail'] = "(stdout tail not available)"
+                        self.__env['stdout_path'] = ""
 
                 # update the panda server
                 try:
@@ -670,14 +710,14 @@ class Monitor:
                     pUtil.tolog("Pilot received a command to turn on debug mode from the server")
                     self.__env['update_freq_server'] = 5*60
                     pUtil.tolog("Server update frequency lowered to %d s" % (self.__env['update_freq_server']))
-                    self.__env['jobDic'][k][1].debug = "True"
+                    self.__env['jobDic'][k][1].debug = True
 
                 # did we receive a command to turn off debug mode?
                 if "debugoff" in self.__env['jobDic'][k][1].action.lower():
                     pUtil.tolog("Pilot received a command to turn off debug mode from the server")
                     self.__env['update_freq_server'] = 30*60
                     pUtil.tolog("Server update frequency increased to %d s" % (self.__env['update_freq_server']))
-                    self.__env['jobDic'][k][1].debug = "False"
+                    self.__env['jobDic'][k][1].debug = False
 
 
     def __loopingJobKiller(self):
@@ -736,9 +776,20 @@ class Monitor:
                                     "DBRelease-" in _file):
                                 _files.append(_file)
                         if _files != []:
-                            pUtil.tolog("Found %d files that were recently updated (e.g. file %s)" % (len(_files), _files[0]))
-                            # get the current system time
-                            self.__env['lastTimeFilesWereModified'][k] = int(time.time())
+                            pUtil.tolog("Found %d files that were recently updated" % len(_files))
+
+                            # now get the mod times for these files, and identify the most recently update file
+                            # try protection against file system problems
+                            try:
+                                latest_modified_file, mtime = find_latest_modified_file(_files)
+                            except Exception as e:
+                                pUtil.tolog("!!WARNING!!2332!! Exception caught (file system problem?): %s" % e)
+                                mtime = None
+
+                            if mtime:
+                                pUtil.tolog("File %s is the most recently updated file (at time=%d)" % (latest_modified_file, mtime))
+                                # set lastTimeFilesWereModified to the mod time of the most recently updated file
+                                self.__env['lastTimeFilesWereModified'][k] = mtime
                         else:
                             pUtil.tolog("WARNING: found no recently updated files!")
                     else:
@@ -1444,6 +1495,10 @@ class Monitor:
                 self.__env['jobDic']["prod"][2] = os.getpgrp()
                 self.__env['jobDic']["prod"][1].result[0] = "running"
 
+                #path = os.path.join(self.__env['jobDic']["prod"][1].workdir, 'cpid.txt')
+                #if writeFile(path, str(os.getpid())):
+                #    pUtil.tolog("Wrote cpid=%s to file %s (pid_1=%d)" % (str(os.getpid()), path, pid_1))
+
                 pUtil.tolog("Parent process %s has set job state: %s" % (pid_1, self.__env['jobDic']["prod"][1].result[0]))
 
                 # do not set self.__jobDic["prod"][1].currentState = "running" here (the state is at this point only needed for the server)
@@ -1456,7 +1511,8 @@ class Monitor:
                 if self.__env['jobDic']["prod"][1].eventService and (pUtil.readpar('catchall') and "HPC" not in pUtil.readpar('catchall')):
                     self.__env['update_freq_server'] =  10 * 60
             else: # child job
-                pUtil.tolog("Starting child process in dir: %s" % self.__env['jobDic']["prod"][1].workdir)
+
+                pUtil.tolog("Starting child process (pid=%d) in dir: %s" % (os.getpid(), self.__env['jobDic']["prod"][1].workdir))
 
                 # Decide which subprocess is to be launched (using info stored in the job object)
                 subprocessName = thisExperiment.getSubprocessName(self.__env['jobDic']["prod"][1].eventService)
@@ -1500,6 +1556,28 @@ class Monitor:
 
                 pUtil.tolog("--- Main pilot monitoring loop (job id %s, state:%s (%s), iteration %d)"
                             % (self.__env['job'].jobId, self.__env['job'].currentState, self.__env['jobDic']["prod"][1].result[0], iteration))
+
+                # update the CPU consumption time
+                t0 = getOsTimesTuple(self.__env['jobDic'][k][1].workdir)
+                if t0 and self.__env['jobDic'][k][1].currentState == 'running':
+                    path = os.path.join(self.__env['jobDic'][k][1].workdir, 'cpid.txt')
+                    cpid = readFile(path)
+                    if cpid:
+                        try:
+                            _cpid = int(cpid)
+                        except Exception as e:
+                            pUtil.tolog('failed to convert %s to int: %s' % (cpid, e))
+                        else:
+                            pUtil.tolog('getting instant CPU consumption time for pid=%d' % _cpid)
+                            cpuconsumptiontime = get_current_cpu_consumption_time(_cpid)
+                            # cpuconsumptiontime = get_instant_cpu_consumption_time(self.__env['jobDic']["prod"][0])
+                            self.__env['jobDic'][k][1].cpuConsumptionTime = int(cpuconsumptiontime)
+                            self.__env['jobDic'][k][1].cpuConsumptionUnit = 's'
+                            self.__env['jobDic'][k][1].cpuConversionFactor = 1.0
+                            pUtil.tolog("Job CPU usage: %d" % (self.__env['jobDic'][k][1].cpuConsumptionTime))
+                    else:
+                        pUtil.tolog('CPU consumption time cannot be calculated since child pid is not known')
+
                 self.__check_memory_usage()
                 self.__check_remaining_space()
                 if self.__env['proxycheckFlag']:
@@ -1661,10 +1739,10 @@ class Monitor:
                                 self.__env['jobDic'][k][1].result[2] = error.ERR_PILOTEXC
                             if self.__env['jobDic'][k][1].pilotErrorDiag == "":
                                 self.__env['jobDic'][k][1].pilotErrorDiag = pilotErrorDiag
-                            if globalSite:
-                                pUtil.postJobTask(self.__env['jobDic'][k][1], globalSite, globalWorkNode,
-                                                  self.__env['experiment'], jr=False)
-                                self.__env['logTransferred'] = True
+                            #if globalSite:
+                            #    pUtil.postJobTask(self.__env['jobDic'][k][1], globalSite, globalWorkNode,
+                            #                      self.__env['experiment'], jr=False)
+                            #    self.__env['logTransferred'] = True
                             pUtil.tolog("Killing process: %d from line %d" % (self.__env['jobDic'][k][0], lineno()))
                             pUtil.createLockFile(True, self.__env['jobDic'][k][1].workdir, lockfile="JOBWILLBEKILLED")
                             killProcesses(self.__env['jobDic'][k][0], self.__env['jobDic'][k][1].pgrp)
@@ -1675,21 +1753,24 @@ class Monitor:
                         # collect all the zombie processes
                         self.__wdog.collectZombieJob(tn=10)
                     else:
-                        pUtil.tolog("Cleanup using globalJob")
-                        globalJob.result[0] = "failed"
-                        globalJob.currentState = globalJob.result[0]
-                        globalJob.result[2] = error.ERR_PILOTEXC
-                        globalJob.pilotErrorDiag = pilotErrorDiag
-                        if globalSite:
-                            pUtil.postJobTask(globalJob, globalSite, globalWorkNode, self.__env['experiment'], jr=False)
+                        pass
+                        #pUtil.tolog("Cleanup using globalJob")
+                        #globalJob.result[0] = "failed"
+                        #globalJob.currentState = globalJob.result[0]
+                        #globalJob.result[2] = error.ERR_PILOTEXC
+                        #globalJob.pilotErrorDiag = pilotErrorDiag
+                        #if globalSite:
+                        #    pUtil.postJobTask(globalJob, globalSite, globalWorkNode, self.__env['experiment'], jr=False)
                 else:
-                    if globalSite:
-                        pUtil.tolog("Do a fast cleanup since server was not updated after job was downloaded (no log)")
-                        pUtil.fastCleanup(globalSite.workdir, self.__env['pilot_initdir'], self.__env['rmwkdir'])
+                    pass
+                    #if globalSite:
+                    #    pUtil.tolog("Do a fast cleanup since server was not updated after job was downloaded (no log)")
+                    #    pUtil.fastCleanup(globalSite.workdir, self.__env['pilot_initdir'], self.__env['rmwkdir'])
             else:
-                if globalSite:
-                    pUtil.tolog("Do a fast cleanup since job was not downloaded (no log)")
-                    pUtil.fastCleanup(globalSite.workdir, self.__env['pilot_initdir'], self.__env['rmwkdir'])
+                pass
+                #if globalSite:
+                #    pUtil.tolog("Do a fast cleanup since job was not downloaded (no log)")
+                #    pUtil.fastCleanup(globalSite.workdir, self.__env['pilot_initdir'], self.__env['rmwkdir'])
             self.__env['return'] = error.ERR_PILOTEXC
             return
 

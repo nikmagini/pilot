@@ -13,7 +13,6 @@
 import os, sys, commands, time
 import traceback
 import atexit, signal
-import stat
 from optparse import OptionParser
 from json import loads
 
@@ -21,14 +20,15 @@ from json import loads
 import Site, pUtil, Job, Node, RunJobUtilities
 import Mover as mover
 from pUtil import tolog, readpar, createLockFile, getDatasetDict, getSiteInformation,\
-     tailPilotErrorDiag, getCmtconfig, getExperiment, getGUID
+     tailPilotErrorDiag, getCmtconfig, getExperiment, getGUID, getWriteToInputFilenames
 from JobRecovery import JobRecovery
 from FileStateClient import updateFileStates, dumpFileStates
 from ErrorDiagnosis import ErrorDiagnosis # import here to avoid issues seen at BU with missing module
 from PilotErrors import PilotErrors
 from shutil import copy2
-from FileHandling import tail, getExtension, extractOutputFiles, getDestinationDBlockItems, getDirectAccess
+from FileHandling import tail, getExtension, extractOutputFiles, getDestinationDBlockItems, getDirectAccess, writeFile, readFile
 from EventRanges import downloadEventRanges
+from processes import get_cpu_consumption_time
 
 # remove logguid, debuglevel - not needed
 # relabelled -h, queuename to -b (debuglevel not used)
@@ -68,6 +68,8 @@ class RunJob(object):
     __jobStateFile = None
     __yodaNodes = None
     __yodaQueue = None
+
+    corruptedFiles = []
 
     # Getter and setter methods
 
@@ -531,7 +533,11 @@ class RunJob(object):
             self.cleanup(job, rf=None)
 
         if job.eventServiceMerge:
-            pilotExitCode = PilotErrors.ERR_ESRECOVERABLE
+            if self.corruptedFiles:
+                job.corruptedFiles = ','.join([e['lfn'] for e in self.corruptedFiles])
+                job.result[2] = self.corruptedFiles[0]['status_code']
+            else:
+                pilotExitCode = PilotErrors.ERR_ESRECOVERABLE
         job.setState(["failed", transExitCode, pilotExitCode])
         if pilotErrorDiag:
             job.pilotErrorDiag = pilotErrorDiag
@@ -652,6 +658,12 @@ class RunJob(object):
         job.result[2], job.pilotErrorDiag, _dummy, FAX_dictionary = mover.get_data_new(job, jobSite, stageinTries=self.__stageinretry, proxycheck=False, workDir=self.__pworkdir, pfc_name=pfc_name, files=files)
 
         t1 = os.times()
+
+        # record failed stagein files
+        for e in job.inData:
+            if e.status == 'error':
+                failed_file = {'lfn': e.lfn, 'status': e.status, 'status_code': e.status_code, 'status_message': e.status_message}
+                self.corruptedFiles.append(failed_file)
 
         job.timeStageIn = int(round(t1[4] - t0[4]))
 
@@ -840,20 +852,55 @@ class RunJob(object):
 
         return directIn
 
-    def replaceLFNsWithTURLs(self, cmd, fname, inFiles):
+    def replaceLFNsWithTURLs(self, cmd, fname, inFiles, workdir, writetofile=""):
         """
         Replace all LFNs with full TURLs.
         This function is used with direct access. Athena requires a full TURL instead of LFN.
         """
 
+        tolog("inside replaceLFNsWithTURLs()")
+        turl_dictionary = {}  # { LFN: TURL, ..}
         if os.path.exists(fname):
             file_info_dictionary = mover.getFileInfoDictionaryFromXML(fname)
+            tolog("file_info_dictionary=%s" % file_info_dictionary)
             for inputFile in inFiles:
-                if inputFile in cmd:
+                if inputFile in file_info_dictionary:
                     turl = file_info_dictionary[inputFile][0]
-                    if turl.startswith('root://') and turl not in cmd:
-                        cmd = cmd.replace(inputFile, turl)
-                        tolog("Replaced '%s' with '%s' in the run command" % (inputFile, turl))
+                    turl_dictionary[inputFile] = turl
+                    if inputFile in cmd:
+                        if turl.startswith('root://') and turl not in cmd:
+                            cmd = cmd.replace(inputFile, turl)
+                            tolog("Replaced '%s' with '%s' in the run command" % (inputFile, turl))
+                else:
+                    tolog("!!WARNING!!3434!! inputFile=%s not in dictionary=%s" % (inputFile, file_info_dictionary))
+
+            tolog("writetofile=%s" % writetofile)
+            tolog("turl_dictionary=%s" % turl_dictionary)
+            # replace the LFNs with TURLs in the writeToFile input file list (if it exists)
+            if writetofile and turl_dictionary:
+                filenames = getWriteToInputFilenames(writetofile)
+                tolog("filenames=%s" % filenames)
+                for fname in filenames:
+                    new_lines = []
+                    path = os.path.join(workdir, fname)
+                    if os.path.exists(path):
+                        f = readFile(path)
+                        tolog("readFile=%s" % f)
+                        for line in f.split('\n'):
+                            fname = os.path.basename(line)
+                            if fname in turl_dictionary:
+                                turl = turl_dictionary[fname]
+                                new_lines.append(turl)
+                            else:
+                                if line:
+                                    new_lines.append(line)
+
+                        lines = '\n'.join(new_lines)
+                        if lines:
+                            writeFile(path, lines)
+                            tolog("lines=%s" % lines)
+                    else:
+                        tolog("!!WARNING!!4546!! File does not exist: %s" % path)
         else:
             tolog("!!WARNING!!4545!! Could not find file: %s (cannot locate TURLs for direct access)" % fname)
 
@@ -898,7 +945,12 @@ class RunJob(object):
 
         # Run the payload process, which could take days to finish
         t0 = os.times()
-        tolog("t0 = %s" % str(t0))
+        path = os.path.join(job.workdir, 't0_times.txt')
+        if writeFile(path, str(t0)):
+            tolog("Wrote %s to file %s" % (str(t0), path))
+        else:
+            tolog("!!WARNING!!3344!! Failed to write t0 to file, will not be able to calculate CPU consumption time on the fly")
+
         res_tuple = (0, 'Undefined')
 
         multi_trf = self.isMultiTrf(runCommandList)
@@ -931,9 +983,14 @@ class RunJob(object):
                 try:
                     analysisJob = job.isAnalysisJob()
                     directIn = self.isDirectAccess(analysisJob, transferType=job.transferType)
+                    tolog("analysisJob=%s" % analysisJob)
+                    tolog("directIn=%s" % directIn)
                     if not analysisJob and directIn:
+                        # replace the LFNs with TURLs in the job command
+                        # (and update the writeToFile input file list if it exists)
                         _fname = os.path.join(job.workdir, "PoolFileCatalog.xml")
-                        cmd = self.replaceLFNsWithTURLs(cmd, _fname, job.inFiles)
+                        cmd = self.replaceLFNsWithTURLs(cmd, _fname, job.inFiles, job.workdir, writetofile=job.writetofile)
+
                 except Exception, e:
                     tolog("Caught exception: %s" % e)
 
@@ -948,6 +1005,10 @@ class RunJob(object):
                 main_subprocess = self.getSubprocess(thisExperiment, cmd, stdout=file_stdout, stderr=file_stderr)
 
                 if main_subprocess:
+
+                    path = os.path.join(job.workdir, 'cpid.txt')
+                    if writeFile(path, str(main_subprocess.pid)):
+                        tolog("Wrote cpid=%s to file %s" % (main_subprocess.pid, path))
                     time.sleep(2)
 
                     # Start the utility if required
@@ -1034,9 +1095,11 @@ class RunJob(object):
                     break
 
         t1 = os.times()
-        tolog("t1 = %s" % str(t1))
-        t = map(lambda x, y:x-y, t1, t0) # get the time consumed
-        job.cpuConsumptionUnit, job.cpuConsumptionTime, job.cpuConversionFactor = pUtil.setTimeConsumed(t)
+        cpuconsumptiontime = get_cpu_consumption_time(t0)
+        job.cpuConsumptionTime = int(cpuconsumptiontime)
+        job.cpuConsumptionUnit = 's'
+        job.cpuConversionFactor = 1.0
+
         tolog("Job CPU usage: %s %s" % (job.cpuConsumptionTime, job.cpuConsumptionUnit))
         tolog("Job CPU conversion factor: %1.10f" % (job.cpuConversionFactor))
         job.timeExe = int(round(t1[4] - t0[4]))
@@ -1239,7 +1302,7 @@ class RunJob(object):
 
         try:
             t0 = os.times()
-            rc, job.pilotErrorDiag, rf, _dummy, job.filesNormalStageOut, job.filesAltStageOut = mover.put_data_new(job, jobSite, stageoutTries=self.__stageoutretry, log_transfer=False)
+            rc, job.pilotErrorDiag, rf, _dummy, job.filesNormalStageOut, job.filesAltStageOut = mover.put_data_new(job, jobSite, stageoutTries=self.__stageoutretry, log_transfer=False, pinitdir=self.__pilot_initdir)
             t1 = os.times()
 
             job.timeStageOut = int(round(t1[4] - t0[4]))
@@ -1859,6 +1922,7 @@ if __name__ == "__main__":
                 if count >= max_count:
                     benchmark_subprocess.send_signal(signal.SIGUSR1)
                     tolog("Terminated the benchmark since it ran for longer than %d s" % (max_count*_sleep))
+                    break
                 else:
                     count += 1
 
@@ -1890,7 +1954,11 @@ if __name__ == "__main__":
         job = ed.interpretPayload(job, res, getstatusoutput_was_interrupted, current_job_number, runCommandList, runJob.getFailureCode())
         if job.result[1] != 0 or job.result[2] != 0:
             if job.eventServiceMerge:
-                job.result[2] = PilotErrors.ERR_ESRECOVERABLE
+                if runJob.corruptedFiles:
+                    job.corruptedFiles = ','.join([e['lfn'] for e in runJob.corruptedFiles])
+                    job.result[2] = runJob.corruptedFiles[0]['status_code']
+                else:
+                    job.result[2] = PilotErrors.ERR_ESRECOVERABLE
             runJob.failJob(job.result[1], job.result[2], job, pilotErrorDiag=job.pilotErrorDiag)
 
         # stage-out ........................................................................................
@@ -1950,7 +2018,15 @@ if __name__ == "__main__":
                 runJob.moveTrfMetadata(job.workdir, job.jobId)
 
             # create the metadata for the output + log files
-            ec, job, outputFileInfo = runJob.createFileMetadata(list(outs), job, outsDict, dsname, datasetDict, jobSite.sitename, analysisJob=analysisJob, fromJSON=fromJSON)
+            ec = 0
+            try:
+                ec, job, outputFileInfo = runJob.createFileMetadata(list(outs), job, outsDict, dsname, datasetDict, jobSite.sitename, analysisJob=analysisJob, fromJSON=fromJSON)
+            except Exception as e:
+                job.pilotErrorDiag = "Exception caught: %s" % e
+                tolog(job.pilotErrorDiag)
+                ec = error.ERR_BADXML
+                job.result[0] = "Badly formed XML (PoolFileCatalog.xml could not be parsed)"
+                job.result[2] = ec
             if ec:
                 runJob.failJob(0, ec, job, pilotErrorDiag=job.pilotErrorDiag)
 

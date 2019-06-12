@@ -7,6 +7,7 @@ import traceback
 from xml.dom import minidom
 from xml.dom.minidom import Document
 from xml.dom.minidom import parse, parseString
+from xml.etree import ElementTree
 
 # Initialize the configuration singleton
 import environment
@@ -620,19 +621,6 @@ def removePyModules(_dir):
                 except:
                     pass
 
-def setTimeConsumed(t_tuple):
-    """ set the system+user time spent by the job """
-
-    # The cpuConsumptionTime is the system+user time while wall time is encoded in pilotTiming, third number.
-    # Previously the cpuConsumptionTime was "corrected" with a scaling factor but this was deemed outdated and is now set to 1.
-
-    t_tot = reduce(lambda x, y:x+y, t_tuple[2:3])
-    conversionFactor = 1.0
-    cpuCU = "s" # "kSI2kseconds"
-    cpuCT = int(t_tot*conversionFactor)
-
-    return cpuCU, cpuCT, conversionFactor
-
 def timeStamp():
     """ return ISO-8601 compliant date/time format """
 
@@ -703,8 +691,8 @@ def getJobStatus(jobId, pshttpurl, psport, path):
                 status = "unknown"
                 attemptNr = -1
                 StatusCode = 20
-        except Exception,e:
-            tolog("Could not interpret job status from dispatcher: %s, %s" % (response, e))
+        except Exception, e:
+            tolog("Could not interpret job status from dispatcher: %s" % (e))
             status = 'unknown'
             attemptNr = -1
             StatusCode = -1
@@ -1211,6 +1199,11 @@ def createPoolFileCatalog(file_dictionary, lfns, pfc_name="PoolFileCatalog.xml",
 
         pfc_text += '</POOLFILECATALOG>\n'
         # tolog(str(doc.toxml()))
+
+        # add escape character for & (needed for google turls)
+        if '&' in pfc_text:
+            pfc_text = pfc_text.replace('&',  '&#038;')
+
         tolog(pfc_text)
 
         try:
@@ -2134,7 +2127,7 @@ def toPandaLogger(data):
         return 0, data, response
 
     except:
-        _type, value, traceBack = sys.exc_info()
+        _type, value, _traceback = sys.exc_info()
         tolog("ERROR : %s %s" % ( _type, traceback.format_exc()))
         return EC_Failed, None, None
 
@@ -2239,7 +2232,7 @@ def toServer(baseURL, cmd, data, path, experiment):
         else:
             return status, None, None
     except:
-        _type, value, traceBack = sys.exc_info()
+        _type, value, _traceback = sys.exc_info()
         tolog("ERROR %s : %s %s" % (cmd, _type, traceback.format_exc()))
         return EC_Failed, None, None
 
@@ -2338,7 +2331,7 @@ def writeToInputFile(path, esFileDictionary, orderedFnameList, eventservice=True
     fnames = {}
     i = 0
     for fname in esFileDictionary.keys():
-        _path = os.path.join(path, fname.replace('.pool.root.', '.txt.'))
+        _path = os.path.join(path, fname.replace('.pool.root.', '.txt.'))  # not necessary?
         try:
             f = open(_path, "w")
         except IOError, e:
@@ -2359,6 +2352,26 @@ def writeToInputFile(path, esFileDictionary, orderedFnameList, eventservice=True
         i += 1
 
     return ec, fnames
+
+def getWriteToInputFilenames(writeToFile):
+    """
+    Extract the writeToFile file name(s).
+    writeToFile='tmpin_mc16_13TeV.345935.PhPy8EG_A14_ttbarMET100_200_hdamp258p75_nonallhad.merge.AOD.e6620_e5984_s3126_r10724_r10726_tid15760866_00:AOD.15760866._000002.pool.root.1'
+    -> return 'tmpin_mc16_13TeV.345935.PhPy8EG_A14_ttbarMET100_200_hdamp258p75_nonallhad.merge.AOD.e6620_e5984_s3126_r10724_r10726_tid15760866_00'
+
+    :param writeToFile:
+    :return:
+    """
+
+    filenames = []
+    entries = writeToFile.split('^')
+    for entry in entries:
+        if ':' in entry:
+            name = entry.split(":")[0]
+            _name = name.replace('.pool.root.', '.txt.')  # not necessary?
+            filenames.append(_name)
+
+    return filenames
 
 def updateESGUIDs(guids):
     """ Update the NULL valued ES guids """
@@ -2430,6 +2443,13 @@ def updateDispatcherData4ES(data, experiment, path):
                 if name_000 in data['jobPars']:
                     tolog("%s in jobPars, replace it with %s" % (name_000, new_name))
                     data['jobPars'] = data['jobPars'].replace(name_000, new_name)
+
+            if data.has_key('eventServiceMerge') and data['eventServiceMerge'].lower() == "true":
+                eventservice = True
+            else:
+                eventservice = False
+            if not eventservice:  # note: for ES there is a different workflow; see Job.py (writeToFile)
+                ec, fnames = writeToInputFile(path, esFileDictionary, orderedFnameList, eventservice)
 
             # Remove the autoconf
             if "--autoConfiguration=everything " in data['jobPars']:
@@ -3081,6 +3101,72 @@ def putMetadata(workdir, jobId, strXML):
 
     return status
 
+def get_metadata_from_xml(workdir, filename="metadata.xml"):
+    """
+    Parse the payload metadata.xml file.
+
+    Example of metadata.xml:
+
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE POOLFILECATALOG SYSTEM 'InMemory'>
+    <POOLFILECATALOG>
+      <File ID="D2A6D6F4-ADB2-B140-9C2E-D2D5C099B342">
+        <logical>
+          <lfn name="RDO_011a43ba-7c98-488d-8741-08da579c5de7.root"/>
+        </logical>
+        <metadata att_name="geometryVersion" att_value="ATLAS-R2-2015-03-01-00"/>
+        <metadata att_name="conditionsTag" att_value="OFLCOND-RUN12-SDR-19"/>
+        <metadata att_name="size" att_value="3250143"/>
+        <metadata att_name="events" att_value="3"/>
+        <metadata att_name="beamType" att_value="collisions"/>
+        <metadata att_name="fileType" att_value="RDO"/>
+      </File>
+    </POOLFILECATALOG>
+
+    which gives the following dictionary:
+
+    {'RDO_011a43ba-7c98-488d-8741-08da579c5de7.root': {'conditionsTag': 'OFLCOND-RUN12-SDR-19',
+    'beamType': 'collisions', 'fileType': 'RDO', 'geometryVersion': 'ATLAS-R2-2015-03-01-00', 'events': '3',
+    'size': '3250143'}}
+
+    :param workdir: payload work directory (string).
+    :param filename: metadata file name (string).
+    :return: metadata dictionary.
+    """
+
+    # metadata_dictionary = { lfn: { att_name1: att_value1, .. }, ..}
+    metadata_dictionary = {}
+    path = os.path.join(workdir, filename)
+    if not os.path.exists(path):
+        tolog('!!WARNING!!1212!! File does not exist: %s' % path)
+        return metadata_dictionary
+
+    tree = ElementTree.parse(path)
+    root = tree.getroot()
+    # root.tag = POOLFILECATALOG
+
+    for child in root:
+        # child.tag = 'File', child.attrib = {'ID': '4ACC5018-2EA3-B441-BC11-0C0992847FD1'}
+        lfn = ""
+        for grandchild in child:
+            # grandchild.tag = 'logical', grandchild.attrib = {}
+            if grandchild.tag == 'logical':
+                for greatgrandchild in grandchild:
+                    # greatgrandchild.tag = lfn
+                    # greatgrandchild.attrib = lfn {'name': 'RDO_011a43ba-7c98-488d-8741-08da579c5de7.root'}
+                    lfn = greatgrandchild.attrib.get('name')
+                    metadata_dictionary[lfn] = {}
+            elif grandchild.tag == 'metadata':
+                # grandchild.attrib = {'att_name': 'events', 'att_value': '3'}
+                name = grandchild.attrib.get('att_name')
+                value = grandchild.attrib.get('att_value')
+                metadata_dictionary[lfn][name] = value
+            else:
+                # unknown metadata entry
+                pass
+
+    return metadata_dictionary
+
 def getMetadata(workdir, jobId, athena=False, altpath=""):
     """ read metadata from file """
 
@@ -3296,9 +3382,6 @@ def safe_call(func, *args):
 
         exc, msg, tb = sys.exc_info()
         traceback.print_tb(tb)
-#        tb = traceback.format_tb(sys.last_traceback)
-#        for line in tb:
-#            tolog(line)
     else:
         status = True
 
@@ -3823,7 +3906,7 @@ def getStdoutDictionary(jobDic):
         jobId = jobDic[k][1].jobId
 
         # abort if not debug mode, but save an empty entry in the dictionary
-        if jobDic[k][1].debug.lower() != "true":
+        if not jobDic[k][1].debug:
             stdout_dictionary[jobId] = ""
             continue
 
@@ -4319,6 +4402,7 @@ def shellExitCode(exitCode):
         error.ERR_MKDIRWORKDIR   : [66, "Could not create directory"],
         error.ERR_NOSUCHFILE     : [67, "No such file or directory"],
         error.ERR_NOVOMSPROXY    : [68, "Voms proxy not valid"],
+        error.ERR_NOPROXY        : [68, "Voms proxy not valid"],
         error.ERR_NOLOCALSPACE   : [69, "No space left on local disk"],
         error.ERR_PILOTEXC       : [70, "Exception caught by pilot"],
         error.ERR_QUEUEDATA      : [71, "Pilot could not download queuedata"],

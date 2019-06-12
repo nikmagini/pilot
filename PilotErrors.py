@@ -143,6 +143,9 @@ class PilotErrors:
     ERR_NORELEASEFOUND = 1244
     ERR_TOOFEWEVENTS = 1245
     ERR_NOUSERTARBALL = 1246
+    ERR_BADXML = 1247
+    ERR_WRONGARCHITECTURE = 1248
+    ERR_RUNGENFAILURE = 1249
 
     # internal error codes
     ERR_DDMREG = 1
@@ -292,6 +295,9 @@ class PilotErrors:
         ERR_NORELEASEFOUND: "No release candidates found",
         ERR_TOOFEWEVENTS: "Too few events, less events than minimal requirement",
         ERR_NOUSERTARBALL: "User tarball cannot be downloaded from PanDA server",
+        ERR_BADXML: "Badly formed XML",
+        ERR_WRONGARCHITECTURE: "Job built on wrong architecture",
+        ERR_RUNGENFAILURE: "RunGen failure (consult log file)",
 
     }
 

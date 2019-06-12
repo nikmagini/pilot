@@ -608,7 +608,11 @@ class ATLASExperiment(Experiment):
                     "saga",
                     "radical",
                     "movers",
-                    "ckpt*"]
+                    "_joproxy15",
+                    "ckpt*",
+                    "HAHM_*",
+                    "Process",
+                    "merged_lhef._0.events-new"]
 
         # remove core and pool.root files from AthenaMP sub directories
         try:
@@ -1424,12 +1428,10 @@ class ATLASExperiment(Experiment):
                 else:
                     # check for specific errors in athena stdout
                     if os.path.exists(filename):
-                        e1 = "prepare 5 database is locked"
-                        e2 = "Error SQLiteStatement"
-                        _out = commands.getoutput('grep "%s" %s | grep "%s"' % (e1, filename, e2))
-                        if 'sqlite' in _out:
-                            job.pilotErrorDiag = "NFS/SQLite locking problems: %s" % (_out)
-                            job.result[2] = error.ERR_NFSSQLITE
+                        if self.isSQLiteLockingProblem(filename, job=job):
+                            tolog("NFS/SQLite locking problem detected")
+                        elif self.isBuiltOnWrongArchitecture(transExitCode, filename, job=job):
+                            tolog("Job was built on the wrong architecture")
                         else:
                             job.pilotErrorDiag = "Job failed: Non-zero failed job return code: %d" % (transExitCode)
                             # (do not set a pilot error code)
@@ -1439,6 +1441,13 @@ class ATLASExperiment(Experiment):
             else:
                 job.pilotErrorDiag = "Payload failed due to unknown reason (check payload stdout)"
                 job.result[2] = error.ERR_UNKNOWN
+
+            # Any errors due to signals can be ignored if the job was killed because of out of memory
+            if os.path.exists(os.path.join(job.workdir, "MEMORYEXCEEDED")):
+                tolog("Ignoring any previously detected errors (like signals) since MEMORYEXCEEDED file was found")
+                job.pilotErrorDiag = "Payload exceeded maximum allowed memory"
+                job.result[2] = error.ERR_PAYLOADEXCEEDMAXMEM
+
             tolog("!!FAILED!!3000!! %s" % (job.pilotErrorDiag))
 
         # set the trf diag error
@@ -1448,6 +1457,60 @@ class ATLASExperiment(Experiment):
 
         job.result[1] = transExitCode
         return job
+
+    def isSQLiteLockingProblem(self, filename, job=None):
+        """
+        Scan for NFS/SQLite locking problems.
+        Note: the function updates the job object.
+
+        :param filename: path to payload stdout (string).
+        :param job: job object.
+        :return: Boolean (True if locking problem has been identified, False otherwise).
+        """
+
+        failed = False
+        error = PilotErrors()
+
+        e1 = "prepare 5 database is locked"
+        e2 = "Error SQLiteStatement"
+        _out = commands.getoutput('grep "%s" %s | grep "%s"' % (e1, filename, e2))
+        if 'sqlite' in _out and job:
+            job.pilotErrorDiag = "NFS/SQLite locking problems: %s" % _out
+            job.result[2] = error.ERR_NFSSQLITE
+            failed = True
+
+        return failed
+
+    def isBuiltOnWrongArchitecture(self, transExitCode, filename, job=None):
+        """
+        Detect if the job was built on the wrong architecture.
+
+        :param transExitCode: payload exit code (int).
+        :param filename: path to payload stdout (string).
+        :param job: job object.
+        :return: Boolean (True if wrong architecture, False if no problem detected).
+        """
+
+        failed = False
+        error = PilotErrors()
+
+        if transExitCode == 221:
+            tolog("Exit code 221 detected, will scan payload stdout for GLIBC errors")
+            e1 = "cling::DynamicLibraryManager::loadLibrary():"
+            e2 = "GLIBC"
+            e3 = "not found"
+            _out = commands.getoutput('grep "%s" %s | grep "%s" | grep "%s"' % (e1, filename, e2, e3))
+            if _out and job:
+                job.pilotErrorDiag = "Architecture problem detected: %s" % _out
+                job.result[2] = error.ERR_WRONGARCHITECTURE
+            else:
+                job.pilotErrorDiag = "General runGen failure"
+                job.result[2] = error.ERR_RUNGENFAILURE
+            failed = True
+
+        tolog("isBuiltOnWrongArchitecture=%s" % str(failed))
+
+        return failed
 
     def isJEMAllowed(self):
         """ Is it allowed to use JEM services? """
@@ -1568,7 +1631,7 @@ class ATLASExperiment(Experiment):
 
         ec = 0
         pilotErrorDiag = ""
-        tolog("pre verifyNCoresSettings")
+
         # Make sure that ATHENA_PROC_NUMBER has a proper value for the current job
         if job.prodSourceLabel != "install":
             ec, pilotErrorDiag = self.verifyNCoresSettings(job.coreCount)

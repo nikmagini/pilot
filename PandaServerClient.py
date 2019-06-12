@@ -322,6 +322,10 @@ class PandaServerClient:
         # build the jobMetrics
         node['jobMetrics'] = self.getJobMetrics(job, site, workerNode)
 
+        # corrupted files
+        if job.corruptedFiles:
+            node['corruptedFiles'] = job.corruptedFiles
+
         # for hpc status
         if job.hpcStatus:
             node['jobSubStatus'] = job.hpcStatus
@@ -758,7 +762,8 @@ class PandaServerClient:
         node['xml'] = self.getXML(job, site.sitename, site.workdir, xmlstr=xmlstr, jr=jr)
 
         # stdout tail in case job.debug == 'true'
-        if job.debug.lower() == "true" and stdout_tail != "":
+        if job.debug and type(stdout_tail) is str and len(stdout_tail) > 0:
+        #if job.debug and stdout_tail and stdout_tail != "":
             # protection for potentially large tails
             stdout_tail = stdout_tail[-2048:]
             node['stdout'] = stdout_tail
@@ -792,7 +797,7 @@ class PandaServerClient:
             else:
                 tolog("stdout_path not set")
         else:
-            if job.debug.lower() != "true":
+            if not job.debug:
                 tolog("Stdout tail will not be sent (debug=False)")
             elif stdout_tail == "":
                 tolog("Stdout tail will not be sent (no stdout tail)")

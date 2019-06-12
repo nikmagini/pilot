@@ -78,7 +78,7 @@ class Job:
         self.isPilotResubmissionRequired = False # Pilot-controlled resubmission
         self.filesizeIn = []               # Input file sizes from the dispatcher
         self.checksumIn = []               # Input file checksums from the dispatcher
-        self.debug = ""                    # debug = True will trigger the pilot to send stdout tail on job update
+        self.debug = False                 # debug = True will trigger the pilot to send stdout tail on job update
         self.lastState = ""                # record the last state of the job
         self.currentState = ""             # Basically the same as result[0] but includes states like "stagein", "stageout"
         self.vmPeakMax = 0                 # Maximum value of vmPeak
@@ -108,6 +108,10 @@ class Job:
         self.dbTime = ""                   # dbTime extracted from jobReport.json, to be used in jobMetrics
         self.dbData = ""                   # dbData extracted from jobReport.json, to be used in jobMetrice
         self.putLogToOS = False            # Job def instruction to ask pilot to transfer log to OS
+        self.writetofile = ""              # path to input file list written to file
+
+        # timing info (for on-the-fly cpu consumption calculation)
+        self.t0 = None
 
         #  event service data
         self.eventService = False          # True for event service jobs
@@ -154,6 +158,9 @@ class Job:
 
         # yoda accounting info
         self.yodaJobMetrics = None
+
+        # corrupted files
+        self.corruptedFiles = None
 
         self.refreshNow = False
 
@@ -361,13 +368,11 @@ class Job:
                 self.eventServiceMerge = False
             pUtil.tolog("eventServiceMerge = %s" % str(self.eventServiceMerge))
 
-        # Event Service merge job
+        # Event Service merge job and jobs that require input file lists
         if self.workdir and data.has_key('writeToFile'): #data.has_key('eventServiceMerge') and data['eventServiceMerge'].lower() == "true":
             #if data.has_key('writeToFile'):
-            writeToFile = data['writeToFile']
-            esFileDictionary, orderedFnameList = pUtil.createESFileDictionary(writeToFile)
-            #pUtil.tolog("esFileDictionary=%s" % (esFileDictionary))
-            #pUtil.tolog("orderedFnameList=%s" % (orderedFnameList))
+            self.writetofile = data['writeToFile']
+            esFileDictionary, orderedFnameList = pUtil.createESFileDictionary(self.writetofile)
             if esFileDictionary != {}:
                 if data.has_key('eventServiceMerge') and data['eventServiceMerge'].lower() == "true":
                     eventservice = True
@@ -431,6 +436,10 @@ class Job:
 
         if data.has_key('cmtConfig'):
             self.cmtconfig = str(data['cmtConfig'])
+
+            # discard any encoded container information
+            if "@" in self.cmtconfig:
+                self.cmtconfig = self.cmtconfig.split("@")[0]
         else:
             # use default
             pass
@@ -453,7 +462,7 @@ class Job:
             # use default
             pass
 
-        self.debug = data.get('debug', 'False')
+        self.debug = data.get('debug', False)
         self.prodSourceLabel = data.get('prodSourceLabel', '')
 
         # PN tmp
@@ -1224,7 +1233,7 @@ class FileSpec(object):
 
     _os_keys = ['eventRangeId', 'storageId', 'eventService', 'allowAllInputRSEs', 'pandaProxySecretKey', 'jobId', 'osPrivateKey', 'osPublicKey', 'pathConvention', 'taskId']
 
-    _local_keys = ['type', 'status', 'replicas', 'surl', 'turl', 'mtime', 'status_code']
+    _local_keys = ['type', 'status', 'replicas', 'surl', 'turl', 'mtime', 'status_code', 'retries']
 
     def __init__(self, **kwargs):
 
@@ -1233,6 +1242,7 @@ class FileSpec(object):
             setattr(self, k, kwargs.get(k, getattr(self, k, None)))
 
         self.filesize = int(getattr(self, 'filesize', 0) or 0)
+        self.retries = 0
         if self.eventService is None:
             self.eventService = False
         self.allowAllInputRSEs = False
@@ -1291,7 +1301,7 @@ class FileSpec(object):
 
         if ensure_replica:
 
-            allowed_replica_schemas = ['root://', 'dcache://', 'dcap://', 'file://']
+            allowed_replica_schemas = ['root://', 'dcache://', 'dcap://', 'file://', 'https://']
 
             if self.turl:
                 if True not in set([self.turl.startswith(e) for e in allowed_replica_schemas]):
